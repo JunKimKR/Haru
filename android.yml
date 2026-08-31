@@ -1,0 +1,324 @@
+name: Build APK
+
+# index.html 을 그대로 감싼 안드로이드 앱(.apk)을 만들어 Releases 에 올립니다.
+# 저장소에 이 파일 하나만 있으면 되고, 안드로이드 프로젝트는 빌드할 때 여기서 만들어집니다.
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'index.html'
+      - 'sw.js'
+      - 'manifest.webmanifest'
+      - 'icon.svg'
+      - '.github/workflows/android.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  apk:
+    name: APK 빌드
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: 안드로이드 프로젝트 생성
+        run: |
+          set -e
+          mkdir -p app/src/main/java/kr/junkim/haru
+          mkdir -p app/src/main/res/values
+          mkdir -p app/src/main/res/drawable
+          mkdir -p app/src/main/res/mipmap-anydpi
+          mkdir -p app/src/main/res/mipmap-anydpi-v26
+          mkdir -p app/src/main/assets
+
+          # ---- 웹 자산 (앱 안에 그대로 들어간다. 인터넷 없이도 열린다) ----
+          cp index.html app/src/main/assets/index.html
+          for f in sw.js manifest.webmanifest icon.svg; do
+            [ -f "$f" ] && cp "$f" app/src/main/assets/ || true
+          done
+          sed -i "s/__BUILD__/${GITHUB_SHA::7}/g" app/src/main/assets/index.html || true
+
+          # ---- settings.gradle ----
+          cat > settings.gradle <<'EOF'
+          pluginManagement {
+            repositories { google(); mavenCentral(); gradlePluginPortal() }
+          }
+          dependencyResolutionManagement {
+            repositoriesMode.set(RepositoriesMode.FAIL_ON_PROJECT_REPOS)
+            repositories { google(); mavenCentral() }
+          }
+          rootProject.name = 'haru'
+          include ':app'
+          EOF
+
+          # ---- 루트 build.gradle ----
+          cat > build.gradle <<'EOF'
+          plugins { id 'com.android.application' version '8.5.2' apply false }
+          EOF
+
+          # ---- gradle.properties ----
+          cat > gradle.properties <<'EOF'
+          android.useAndroidX=true
+          org.gradle.jvmargs=-Xmx3g -Dfile.encoding=UTF-8
+          org.gradle.parallel=true
+          EOF
+
+          # ---- app/build.gradle ----
+          cat > app/build.gradle <<'EOF'
+          plugins { id 'com.android.application' }
+
+          android {
+              namespace 'kr.junkim.haru'
+              compileSdk 34
+
+              defaultConfig {
+                  applicationId 'kr.junkim.haru'
+                  minSdk 26
+                  targetSdk 34
+                  versionCode (System.getenv('GITHUB_RUN_NUMBER') ?: '1') as int
+                  versionName '1.0.' + (System.getenv('GITHUB_RUN_NUMBER') ?: '0')
+              }
+
+              signingConfigs {
+                  release {
+                      storeFile file('keystore.jks')
+                      storePassword 'haruplanner'
+                      keyAlias 'haru'
+                      keyPassword 'haruplanner'
+                  }
+              }
+
+              buildTypes {
+                  release {
+                      signingConfig signingConfigs.release
+                      minifyEnabled false
+                  }
+              }
+
+              compileOptions {
+                  sourceCompatibility JavaVersion.VERSION_17
+                  targetCompatibility JavaVersion.VERSION_17
+              }
+          }
+
+          dependencies {
+              implementation 'androidx.webkit:webkit:1.11.0'
+          }
+          EOF
+
+          # ---- AndroidManifest.xml ----
+          cat > app/src/main/AndroidManifest.xml <<'EOF'
+          <?xml version="1.0" encoding="utf-8"?>
+          <manifest xmlns:android="http://schemas.android.com/apk/res/android">
+
+              <uses-permission android:name="android.permission.INTERNET" />
+
+              <application
+                  android:allowBackup="true"
+                  android:hardwareAccelerated="true"
+                  android:icon="@mipmap/ic_launcher"
+                  android:roundIcon="@mipmap/ic_launcher"
+                  android:label="@string/app_name"
+                  android:supportsRtl="true"
+                  android:theme="@style/AppTheme">
+
+                  <activity
+                      android:name=".MainActivity"
+                      android:exported="true"
+                      android:launchMode="singleTask"
+                      android:windowSoftInputMode="adjustResize"
+                      android:configChanges="orientation|screenSize|smallestScreenSize|screenLayout|keyboard|keyboardHidden|navigation|uiMode|density|fontScale">
+                      <intent-filter>
+                          <action android:name="android.intent.action.MAIN" />
+                          <category android:name="android.intent.category.LAUNCHER" />
+                      </intent-filter>
+                  </activity>
+              </application>
+          </manifest>
+          EOF
+
+          # ---- MainActivity.java ----
+          cat > app/src/main/java/kr/junkim/haru/MainActivity.java <<'EOF'
+          package kr.junkim.haru;
+
+          import android.app.Activity;
+          import android.os.Bundle;
+          import android.view.ViewGroup;
+          import android.webkit.WebResourceRequest;
+          import android.webkit.WebResourceResponse;
+          import android.webkit.WebSettings;
+          import android.webkit.WebView;
+          import android.webkit.WebViewClient;
+
+          import androidx.webkit.WebViewAssetLoader;
+
+          /**
+           * assets/index.html 을 https://appassets.androidplatform.net/assets/ 로 띄운다.
+           * file:// 대신 진짜 https 출처를 쓰기 때문에 localStorage 에 기록이 안전하게 남는다.
+           */
+          public class MainActivity extends Activity {
+
+              private static final String HOME =
+                      "https://appassets.androidplatform.net/assets/index.html";
+
+              private WebView web;
+
+              @Override
+              protected void onCreate(Bundle state) {
+                  super.onCreate(state);
+
+                  final WebViewAssetLoader loader = new WebViewAssetLoader.Builder()
+                          .addPathHandler("/assets/", new WebViewAssetLoader.AssetsPathHandler(this))
+                          .build();
+
+                  web = new WebView(this);
+                  web.setLayoutParams(new ViewGroup.LayoutParams(
+                          ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT));
+                  web.setBackgroundColor(0xFFFFFFFF);
+
+                  WebSettings s = web.getSettings();
+                  s.setJavaScriptEnabled(true);
+                  s.setDomStorageEnabled(true);
+                  s.setDatabaseEnabled(true);
+                  s.setUseWideViewPort(true);
+                  s.setLoadWithOverviewMode(false);
+                  s.setSupportZoom(false);
+                  s.setBuiltInZoomControls(false);
+                  s.setDisplayZoomControls(false);
+                  s.setTextZoom(100);
+                  s.setCacheMode(WebSettings.LOAD_DEFAULT);
+
+                  web.setWebViewClient(new WebViewClient() {
+                      @Override
+                      public WebResourceResponse shouldInterceptRequest(WebView view, WebResourceRequest req) {
+                          return loader.shouldInterceptRequest(req.getUrl());
+                      }
+                  });
+
+                  setContentView(web);
+
+                  if (state != null) {
+                      web.restoreState(state);
+                  } else {
+                      web.loadUrl(HOME);
+                  }
+              }
+
+              @Override
+              protected void onSaveInstanceState(Bundle out) {
+                  super.onSaveInstanceState(out);
+                  web.saveState(out);
+              }
+
+              @Override
+              public void onBackPressed() {
+                  finish();
+              }
+          }
+          EOF
+
+          # ---- 리소스 ----
+          cat > app/src/main/res/values/strings.xml <<'EOF'
+          <?xml version="1.0" encoding="utf-8"?>
+          <resources>
+              <string name="app_name">하루 정산소</string>
+          </resources>
+          EOF
+
+          cat > app/src/main/res/values/colors.xml <<'EOF'
+          <?xml version="1.0" encoding="utf-8"?>
+          <resources>
+              <color name="paper">#FFFFFFFF</color>
+              <color name="ink">#FF23486B</color>
+          </resources>
+          EOF
+
+          cat > app/src/main/res/values/styles.xml <<'EOF'
+          <?xml version="1.0" encoding="utf-8"?>
+          <resources>
+              <style name="AppTheme" parent="@android:style/Theme.Material.Light.NoActionBar">
+                  <item name="android:windowBackground">@color/paper</item>
+                  <item name="android:statusBarColor">@color/paper</item>
+                  <item name="android:navigationBarColor">@color/paper</item>
+                  <item name="android:windowLightStatusBar">true</item>
+                  <item name="android:windowLightNavigationBar">true</item>
+              </style>
+          </resources>
+          EOF
+
+          cat > app/src/main/res/drawable/ic_fg.xml <<'EOF'
+          <?xml version="1.0" encoding="utf-8"?>
+          <vector xmlns:android="http://schemas.android.com/apk/res/android"
+              android:width="108dp" android:height="108dp"
+              android:viewportWidth="108" android:viewportHeight="108">
+              <path android:pathData="M36,32 h36 a3,3 0 0 1 3,3 v41 a3,3 0 0 1 -3,3 h-36 a3,3 0 0 1 -3,-3 v-41 a3,3 0 0 1 3,-3 z"
+                  android:fillColor="#00000000" android:strokeColor="#23486B" android:strokeWidth="3.4"/>
+              <path android:pathData="M33,44 h42"
+                  android:strokeColor="#23486B" android:strokeWidth="3.4"/>
+              <path android:pathData="M43,55 h13"
+                  android:strokeColor="#23486B" android:strokeWidth="3.2" android:strokeLineCap="round" android:strokeAlpha="0.45"/>
+              <path android:pathData="M43,64 h22"
+                  android:strokeColor="#23486B" android:strokeWidth="3.2" android:strokeLineCap="round" android:strokeAlpha="0.45"/>
+              <path android:pathData="M45,70 l5,5 l12,-14"
+                  android:fillColor="#00000000" android:strokeColor="#B03A2E" android:strokeWidth="4"
+                  android:strokeLineCap="round" android:strokeLineJoin="round"/>
+          </vector>
+          EOF
+
+          cat > app/src/main/res/mipmap-anydpi-v26/ic_launcher.xml <<'EOF'
+          <?xml version="1.0" encoding="utf-8"?>
+          <adaptive-icon xmlns:android="http://schemas.android.com/apk/res/android">
+              <background android:drawable="@color/paper"/>
+              <foreground android:drawable="@drawable/ic_fg"/>
+          </adaptive-icon>
+          EOF
+
+          cp app/src/main/res/drawable/ic_fg.xml app/src/main/res/mipmap-anydpi/ic_launcher.xml
+
+      - name: 서명 키 준비
+        run: |
+          cat > keystore.b64 <<'EOF'
+          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
+          EOF
+          tr -d ' \n' < keystore.b64 | base64 -d > app/keystore.jks
+          rm keystore.b64
+          ls -l app/keystore.jks
+
+      - uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: '8.7'
+
+      - name: 빌드
+        run: gradle assembleRelease --no-daemon --stacktrace
+
+      - name: 이름 정리
+        id: apk
+        run: |
+          SRC=$(find app/build/outputs/apk/release -name '*.apk' | head -1)
+          OUT="haru-jeongsanso-v1.0.${GITHUB_RUN_NUMBER}.apk"
+          cp "$SRC" "$OUT"
+          echo "path=$OUT" >> "$GITHUB_OUTPUT"
+          ls -lh "$OUT"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: apk
+          path: ${{ steps.apk.outputs.path }}
+
+      - name: Release 로 올리기
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: apk-v1.0.${{ github.run_number }}
+          name: 하루 정산소 v1.0.${{ github.run_number }}
+          body: |
+            안드로이드에 바로 설치할 수 있는 APK 입니다.
+            아래 `.apk` 를 휴대폰에서 눌러 받고, "출처를 알 수 없는 앱 설치"를 허용하면 됩니다.
+          files: ${{ steps.apk.outputs.path }}
